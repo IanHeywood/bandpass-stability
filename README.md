@@ -19,6 +19,8 @@ other formats can be added as required. Each table will at present be treated as
 epoch, with stability metrics being computed by analysing the properties of the 
 bandpass over the whole set. Intra-table processing for very short timescale stability 
 analyses is also pending, and will likely be added as a separate command line utility.
+Note that the input tables used for stability analyses should _not_ be normalised, as this
+would completely obfuscate instrumental amplitude drift between epochs.
 
 The workflow and each associated tool is as follows:
 
@@ -62,7 +64,7 @@ The outputs are written for each antenna into `lag_residual_results/<antenna_nam
 For each adjacent pair of bandpass tables ${B_n}(\nu)$ and ${B_{n+1}}(\nu)$ the lagged complex ratio $R_n(\nu)$ is formed:
 
 $$
-R_n(\nu) = \frac{B_n+1(\nu)}{B_{n}(\nu)}
+R_n(\nu) = \frac{B_{n+1}(\nu)}{B_{n}(\nu)}
 $$
 
 The log-amplitude and phase residuals are then:
