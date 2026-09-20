@@ -1,0 +1,130 @@
+Metadata-Version: 2.4
+Name: bandpass-stability
+Version: 0.1.0
+Summary: Gauge the stability of per-antenna bandpass solutions over time.
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: matplotlib
+Requires-Dist: python-casacore
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+
+# bandpass-stability
+
+Gauge the stability of per-antenna bandpass solutions for a
+dish-based interferometer, across a sequence of calibrator
+observations.
+
+## Pipeline
+
+Bandpass tables themselves are derived separately (CASA `bandpass`
+task, run outside this package). This package covers everything
+after that:
+
+1. **Smooth** each bandpass table with a median filter along the
+   frequency axis (`bandpass-smooth`).
+2. **Map** each table's antenna *index* to its physical antenna
+   *name*, by consulting the parent Measurement Set. This matters
+   because the same index can refer to a different physical antenna
+   in different epochs (`bandpass-map`).
+3. **Analyse**: for each physical antenna, compare every pair of
+   time-adjacent bandpass tables, and produce per-channel and
+   per-pair stability metrics and plots (`bandpass-lag`).
+
+## Setup
+
+python-casacore is often only available via conda or a system
+package on radio-astronomy servers, so check that first:
+
+```bash
+python3 -c "import casacore"
+```
+
+If that already works outside any environment, create the venv with
+access to system packages:
+
+```bash
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+If it does **not** work outside an environment (python-casacore is
+pip-installable in your setup), a plain venv is fine:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+Either way, this installs three commands (`bandpass-smooth`,
+`bandpass-map`, `bandpass-lag`) onto your `PATH` while the venv is
+active.
+
+For development (running the test suite):
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+## Usage
+
+```bash
+# 1. Smooth every bandpass table matching the pattern.
+bandpass-smooth 'cal_*.B0' --window 95
+
+# 2. Build the antenna index -> name mapping.
+#
+#    IMPORTANT: point this at the SMOOTHED tables specifically.
+#    A pattern that also matches the un-smoothed originals will
+#    double-count every observation.
+bandpass-map 'cal_*_smooth.B0' -o bandpass_antenna_mapping.csv
+
+# 3. Run the adjacent-epoch stability analysis.
+bandpass-lag bandpass_antenna_mapping.csv --spw 0 --pol 0
+```
+
+Inspect `bandpass_antenna_mapping.csv` before running step 3 — it's
+worth eyeballing that antenna names look right and that no table is
+listed twice.
+
+Run `bandpass-smooth --help`, `bandpass-map --help`, or
+`bandpass-lag --help` for the full list of options (output paths,
+polarization, SPW, maximum allowed gap between adjacent pairs, and
+so on).
+
+### Outputs
+
+`bandpass-lag` writes, per antenna, into
+`lag_residual_results/<antenna_name>/`:
+
+- `pair_metrics.csv` — one row per adjacent table pair, with
+  amplitude and phase RMS residuals over all common channels.
+- `pair_rms.png` — those RMS values plotted against pair index; a
+  sudden jump indicates a sudden change in the instrumental
+  bandpass over that interval.
+- `channel_summary.png` — the median and 16th/84th percentile
+  amplitude and phase residual per channel, across all adjacent
+  pairs; shows which channels are most/least stable over time.
+
+## Package layout
+
+```
+src/bandpass_stability/
+  caltable_utils.py    # shared helpers: sorting, filenames, CPARAM shape handling
+  smoothing.py          # step 1: median-filter bandpass tables
+  antenna_mapping.py    # step 2: antenna index -> name mapping
+  lag_analysis.py        # step 3: adjacent-epoch residuals and stability metrics
+  cli.py                 # argparse entry points, one per command
+tests/                    # unit tests for the logic in each module above
+```
+
+The CLI layer is deliberately thin — each command just parses
+arguments and calls one function in the corresponding module. All
+core logic is plain functions taking explicit arguments (no reliance
+on global constants), so it can be imported, reused, and unit-tested
+independently of the command line.

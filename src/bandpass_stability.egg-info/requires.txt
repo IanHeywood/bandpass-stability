@@ -1,0 +1,7 @@
+numpy
+scipy
+matplotlib
+python-casacore
+
+[dev]
+pytest

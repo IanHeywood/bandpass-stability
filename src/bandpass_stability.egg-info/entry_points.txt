@@ -1,0 +1,4 @@
+[console_scripts]
+bandpass-lag = bandpass_stability.cli:lag_main
+bandpass-map = bandpass_stability.cli:map_main
+bandpass-smooth = bandpass_stability.cli:smooth_main

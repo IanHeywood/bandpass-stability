@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bandpass-stability"
+version = "0.1.0"
+description = "Gauge the stability of per-antenna bandpass solutions over time."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "python-casacore",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+bandpass-smooth = "bandpass_stability.cli:smooth_main"
+bandpass-map = "bandpass_stability.cli:map_main"
+bandpass-lag = "bandpass_stability.cli:lag_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
