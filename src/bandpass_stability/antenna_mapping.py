@@ -5,12 +5,15 @@ antenna name in its parent Measurement Set.
 This exists because CASA bandpass tables record antenna solutions by
 integer index only. The same index can refer to a different physical
 antenna in different epochs or array builds, so every downstream 
-comparison must track the antenna *name*, looked up pet table, rather 
+comparison must track the antenna *name*, looked up per table, rather 
 than assuming the index is stable over the set.
 
-It is assumed that the name of each bandpass table contains the complete 
-parent MS name, e.g. for a bandpass table named `cal_observation.ms.B0`
-the parent MS would be `observation.ms`.
+It is assumed that the name of each bandpass table contains the complete
+parent MS name, and that the MS sits in the same directory as the table.
+Everything up to and including the first '.ms' in the table name is
+taken as the MS name, with a leading 'cal_' prefix removed, e.g. for a
+bandpass table named `cal_observation.ms.B0` the parent MS would be
+`observation.ms` in the same directory.
 """
 
 import csv

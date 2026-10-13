@@ -2,6 +2,7 @@ import numpy as np
 
 from bandpass_stability.smoothing import (
     choose_window,
+    clean_and_smooth_bandpass,
     find_valid_segments,
     smooth_complex_bandpass,
     smooth_real_array,
@@ -94,3 +95,111 @@ def test_smooth_complex_bandpass_reduces_amplitude_noise():
     noise_after = np.std(np.abs(smoothed) - true_amplitude)
 
     assert noise_after < noise_before
+
+
+def _noisy_bandpass(nchan=600, seed=4):
+    rng = np.random.default_rng(seed)
+    amplitude = 1.0 + 0.1 * np.sin(np.arange(nchan) / 80.0)
+    amplitude = amplitude * np.exp(rng.normal(0, 0.01, nchan))
+    phase = np.radians(rng.normal(0, 0.5, nchan))
+    return amplitude * np.exp(1j * phase)
+
+
+def test_smoothing_removes_spike_at_segment_edge():
+    spectrum = _noisy_bandpass()
+    flags = np.zeros(spectrum.size, dtype=bool)
+    flags[300:320] = True
+    spectrum[298:300] *= 10.0  # spike right against the flagged gap
+
+    smoothed = smooth_complex_bandpass(spectrum, flags, window=95)
+
+    assert np.all(np.abs(smoothed[298:300]) < 2.0)
+
+
+def test_clean_and_smooth_flags_edge_block_when_clipping():
+    spectrum = _noisy_bandpass()
+    flags = np.zeros(spectrum.size, dtype=bool)
+    flags[300:320] = True
+    spectrum[285:300] *= np.exp(1j * np.radians(-12.0))
+
+    output, output_flags, n_grown, n_clipped = clean_and_smooth_bandpass(
+        spectrum, flags, window=95, clip_sigma=5.0
+    )
+
+    assert output_flags[285:300].all()
+    assert n_clipped >= 15
+    assert n_grown == 0
+    # Original flags pass through; clipped channels keep their input values.
+    assert output_flags[300:320].all()
+    np.testing.assert_array_equal(output[285:300], spectrum[285:300])
+
+
+def test_clean_and_smooth_without_options_leaves_flags_unchanged():
+    spectrum = _noisy_bandpass()
+    flags = np.zeros(spectrum.size, dtype=bool)
+    flags[100:110] = True
+
+    _, output_flags, n_grown, n_clipped = clean_and_smooth_bandpass(spectrum, flags, window=95)
+
+    np.testing.assert_array_equal(output_flags, flags)
+    assert n_grown == 0 and n_clipped == 0
+
+
+def test_clean_and_smooth_flag_growth():
+    spectrum = _noisy_bandpass()
+    flags = np.zeros(spectrum.size, dtype=bool)
+    flags[300:320] = True
+
+    _, output_flags, n_grown, _ = clean_and_smooth_bandpass(
+        spectrum, flags, window=95, flag_grow=3
+    )
+
+    assert n_grown == 6
+    assert output_flags[297:323].all()
+    assert not output_flags[296] and not output_flags[323]
+
+
+def test_clean_and_smooth_handles_half_turn_block():
+    # A 180-degree block can trip np.unwrap into a 2*pi step; the
+    # clipping must still remove it and leave the rest untouched.
+    spectrum = _noisy_bandpass()
+    flags = np.zeros(spectrum.size, dtype=bool)
+    spectrum[400:405] *= -1.0
+
+    output, output_flags, _, n_clipped = clean_and_smooth_bandpass(
+        spectrum, flags, window=95, clip_sigma=5.0
+    )
+
+    assert output_flags[400:405].all()
+    assert n_clipped <= 10
+    kept = ~output_flags
+    assert np.all(np.abs(np.degrees(np.angle(output[kept]))) < 5.0)
+
+
+def test_smoothing_follows_a_steep_delay_slope():
+    # Several full turns across the band must survive smoothing, even
+    # though the phase is never unwrapped.
+    rng = np.random.default_rng(8)
+    nchan = 2000
+    channel = np.arange(nchan)
+    true_phase = 2 * np.pi * 5.0 * channel / nchan
+    spectrum = np.exp(1j * (true_phase + np.radians(rng.normal(0, 1.0, nchan))))
+    flags = np.zeros(nchan, dtype=bool)
+    flags[900:950] = True
+
+    smoothed = smooth_complex_bandpass(spectrum, flags, window=95)
+
+    error = np.degrees(np.angle(smoothed[~flags] * np.exp(-1j * true_phase[~flags])))
+    assert np.max(np.abs(error)) < 2.0
+
+
+def test_smoothing_alone_is_not_disturbed_by_half_turn_block():
+    spectrum = _noisy_bandpass()
+    flags = np.zeros(spectrum.size, dtype=bool)
+    spectrum[400:405] *= -1.0
+
+    smoothed = smooth_complex_bandpass(spectrum, flags, window=95)
+
+    # Without clipping the block stays unflagged, but the median
+    # removes it and the rest of the band is unaffected.
+    assert np.all(np.abs(np.degrees(np.angle(smoothed))) < 5.0)

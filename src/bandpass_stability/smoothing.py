@@ -1,10 +1,27 @@
 """
 De-noise CASA bandpass calibration tables with a median filter along
-the frequency axis.
+the frequency axis, optionally flagging errant channels first.
 
-Smoothing is performed on log-amplitude and unwrapped phase
-independently, inside each contiguous run of unflagged channels.
+Smoothing is performed on log-amplitude and phase independently,
+inside each contiguous run of unflagged channels. Phase is smoothed
+without unwrapping (after removing the overall delay slope), so a
+short half-turn block cannot shift the rest of the segment by a turn.
 Flagged channels are never smoothed across and are left unchanged.
+
+Two optional cleaning steps can run before the smoothing, and both
+write their results into the FLAG column of the output table:
+
+  - flag growth: extend every existing flagged region by a number of
+    channels on each side, to catch residual RFI in the wings of
+    regions that were flagged but not quite widely enough;
+  - local clipping: iteratively flag channels whose log-amplitude or
+    phase deviates from a running-median baseline by more than a
+    chosen multiple of the local robust sigma.
+
+The running median mirrors the data at segment edges
+(`mode="reflect"`). Padding with copies of the edge channel instead
+(`mode="nearest"`) lets a feature at a segment edge win the median,
+so it survives smoothing intact and is invisible to clipping.
 """
 
 import glob
@@ -12,9 +29,18 @@ import os
 import shutil
 
 import numpy as np
-from scipy.ndimage import median_filter
 
 from .caltable_utils import iter_pol_spectra, natural_sort_key, set_pol_spectrum
+from .robust import (  # noqa: F401  (choose_window, find_valid_segments re-exported)
+    choose_window,
+    circular_running_median,
+    estimate_linear_phase,
+    find_valid_segments,
+    grow_flags,
+    iterative_local_clip,
+    masked_running_median,
+    wrap_phase,
+)
 
 
 # ============================================================
@@ -47,6 +73,8 @@ def make_output_path(input_path, output_tag):
 
         input.B0  ->  input_smooth.B0
     """
+    input_path = input_path.rstrip(os.sep)
+
     if input_path.endswith(".B0"):
         return input_path[:-3] + output_tag + ".B0"
 
@@ -54,80 +82,47 @@ def make_output_path(input_path, output_tag):
 
 
 # ============================================================
-# Mask helpers
-# ============================================================
-
-def find_valid_segments(valid):
-    """
-    Return contiguous True regions of a boolean array as
-    (start, end) pairs. `end` is exclusive.
-    """
-    segments = []
-
-    in_segment = False
-    start = None
-
-    for channel in range(len(valid)):
-        if valid[channel] and not in_segment:
-            start = channel
-            in_segment = True
-
-        elif not valid[channel] and in_segment:
-            segments.append((start, channel))
-            in_segment = False
-
-    if in_segment:
-        segments.append((start, len(valid)))
-
-    return segments
-
-
-def choose_window(requested_window, segment_length):
-    """
-    Choose an odd window size no larger than the segment it will be
-    applied to.
-    """
-    window = min(requested_window, segment_length)
-
-    if window % 2 == 0:
-        window -= 1
-
-    return max(window, 1)
-
-
-# ============================================================
 # Smoothing
 # ============================================================
 
-def smooth_real_array(values, valid, window):
+def smooth_real_array(values, valid, window, use=None):
     """
     Median-smooth a real-valued spectrum inside each contiguous
     valid region. Flagged gaps are never crossed.
+
+    If `use` is given, only those channels contribute to (and receive)
+    the smoothed values, but they are filtered as one run within each
+    valid segment, so channels removed by clipping are bridged.
     """
-    output = np.full_like(values, np.nan, dtype=float)
+    if use is None:
+        use = valid
 
-    for start, end in find_valid_segments(valid):
-        segment = values[start:end]
-
-        if len(segment) == 0:
-            continue
-
-        local_window = choose_window(window, len(segment))
-
-        output[start:end] = median_filter(
-            segment, size=local_window, mode="nearest"
-        )
-
-    return output
+    return masked_running_median(values, valid, use, window)
 
 
-def smooth_complex_bandpass(complex_bandpass, flags, window):
+def clean_and_smooth_bandpass(complex_bandpass, flags, window,
+                              clip_sigma=None, flag_grow=0):
     """
-    Smooth one complex bandpass spectrum.
+    Optionally flag errant channels, then smooth one complex bandpass
+    spectrum.
 
-    The smoothing is performed on log(amplitude) and unwrapped
-    phase. Existing flagged channels remain flagged and are not
-    used as smoothing input.
+    Steps:
+      1. channels that are flagged, non-finite or zero are invalid;
+      2. if `flag_grow` > 0, every invalid region is widened by that
+         many channels on each side;
+      3. if `clip_sigma` is set, channels whose log-amplitude or phase
+         deviates from a running-median baseline by more than
+         `clip_sigma` local robust sigmas are rejected, iteratively,
+         until a pass rejects nothing new;
+      4. the surviving channels are median-smoothed in log-amplitude
+         and phase. Phase is smoothed without unwrapping: the overall
+         delay slope is removed, a wrap-proof running median is taken
+         (`circular_running_median`), and the slope is added back.
+
+    Returns (smoothed_bandpass, output_flags, n_grown, n_clipped).
+    Channels flagged in steps 2-3 keep their original (unsmoothed)
+    values and are set True in `output_flags`; all other flags are
+    passed through unchanged.
     """
     complex_bandpass = np.asarray(complex_bandpass)
     flags = np.asarray(flags, dtype=bool)
@@ -137,21 +132,41 @@ def smooth_complex_bandpass(complex_bandpass, flags, window):
 
     valid = (~flags) & np.isfinite(complex_bandpass) & (amplitude > 0.0)
 
-    log_amplitude = np.full_like(amplitude, np.nan, dtype=float)
+    grown_valid = grow_flags(valid, flag_grow)
+    n_grown = int(np.count_nonzero(valid & ~grown_valid))
+
+    log_amplitude = np.full(amplitude.shape, np.nan, dtype=float)
     log_amplitude[valid] = np.log(amplitude[valid])
 
-    unwrapped_phase = np.full_like(wrapped_phase, np.nan, dtype=float)
+    # Remove the overall delay slope, so the phase changes slowly within
+    # one window and can be handled without unwrapping (see
+    # `circular_running_median`); it is added back at the end.
+    channel = np.arange(complex_bandpass.size)
+    _, slope = estimate_linear_phase(wrapped_phase, grown_valid)
+    derotated_phase = wrap_phase(wrapped_phase - slope * channel)
+    derotated_phase[~valid] = np.nan
 
-    for start, end in find_valid_segments(valid):
-        unwrapped_phase[start:end] = np.unwrap(wrapped_phase[start:end])
+    keep = iterative_local_clip(
+        np.vstack([log_amplitude, derotated_phase]),
+        segments_valid=grown_valid,
+        window=window,
+        clip_sigma=clip_sigma,
+        wrap=[False, True],
+        use=grown_valid,
+    )
 
-    smooth_log_amplitude = smooth_real_array(log_amplitude, valid, window)
-    smooth_phase = smooth_real_array(unwrapped_phase, valid, window)
+    n_clipped = int(np.count_nonzero(grown_valid & ~keep))
+
+    smooth_log_amplitude = smooth_real_array(log_amplitude, grown_valid, window, use=keep)
+    smooth_phase = (
+        circular_running_median(derotated_phase, grown_valid, keep, window)
+        + slope * channel
+    )
 
     output = complex_bandpass.copy()
 
     smooth_valid = (
-        valid
+        keep
         & np.isfinite(smooth_log_amplitude)
         & np.isfinite(smooth_phase)
     )
@@ -159,6 +174,20 @@ def smooth_complex_bandpass(complex_bandpass, flags, window):
     output[smooth_valid] = np.exp(
         smooth_log_amplitude[smooth_valid] + 1j * smooth_phase[smooth_valid]
     )
+
+    output_flags = flags | (valid & ~keep)
+
+    return output, output_flags, n_grown, n_clipped
+
+
+def smooth_complex_bandpass(complex_bandpass, flags, window):
+    """
+    Smooth one complex bandpass spectrum without any extra flagging.
+
+    The smoothing is performed on log(amplitude) and phase. Existing flagged channels remain flagged and are not
+    used as smoothing input.
+    """
+    output, _, _, _ = clean_and_smooth_bandpass(complex_bandpass, flags, window)
 
     return output
 
@@ -168,9 +197,13 @@ def smooth_complex_bandpass(complex_bandpass, flags, window):
 # ============================================================
 
 def plot_table(input_path, output_path, input_amplitudes, input_phases,
-                output_amplitudes, output_phases, flags):
+               output_amplitudes, output_phases, flags, new_flags=None):
     """
     Make a simple input/output diagnostic plot for one table.
+
+    `flags` are the original flags; `new_flags` (optional) marks
+    channels flagged by this step, which are drawn as black crosses on
+    the input panels and are absent from the output panels.
     """
     import matplotlib.pyplot as plt
 
@@ -180,6 +213,10 @@ def plot_table(input_path, output_path, input_amplitudes, input_phases,
     output_phases = np.asarray(output_phases)
     flags = np.asarray(flags, dtype=bool)
 
+    if new_flags is None:
+        new_flags = np.zeros_like(flags)
+    new_flags = np.asarray(new_flags, dtype=bool)
+
     input_amp_plot = input_amplitudes.copy()
     input_phase_plot = input_phases.copy()
     output_amp_plot = output_amplitudes.copy()
@@ -187,8 +224,8 @@ def plot_table(input_path, output_path, input_amplitudes, input_phases,
 
     input_amp_plot[flags] = np.nan
     input_phase_plot[flags] = np.nan
-    output_amp_plot[flags] = np.nan
-    output_phase_plot[flags] = np.nan
+    output_amp_plot[flags | new_flags] = np.nan
+    output_phase_plot[flags | new_flags] = np.nan
 
     channels = np.arange(input_amplitudes.shape[1])
 
@@ -203,6 +240,18 @@ def plot_table(input_path, output_path, input_amplitudes, input_phases,
         axes[0, 1].plot(channels, spectrum, linewidth=0.7, alpha=0.7)
     axes[0, 1].set_title("Input phase")
     axes[0, 1].set_ylabel("Phase [deg]")
+
+    if new_flags.any():
+        rows, columns = np.nonzero(new_flags)
+        axes[0, 0].plot(
+            columns, input_amplitudes[rows, columns], "x", color="black",
+            markersize=3, label="flagged by this step",
+        )
+        axes[0, 1].plot(
+            columns, input_phases[rows, columns], "x", color="black",
+            markersize=3, label="flagged by this step",
+        )
+        axes[0, 0].legend(loc="best", fontsize="small")
 
     for spectrum in output_amp_plot:
         axes[1, 0].plot(channels, spectrum, linewidth=0.8)
@@ -219,7 +268,7 @@ def plot_table(input_path, output_path, input_amplitudes, input_phases,
     for axis in axes.flat:
         axis.grid(True, alpha=0.25)
 
-    fig.suptitle(os.path.basename(input_path))
+    fig.suptitle(os.path.basename(input_path.rstrip(os.sep)))
     plt.tight_layout()
 
     plot_path = output_path + ".png"
@@ -233,9 +282,14 @@ def plot_table(input_path, output_path, input_amplitudes, input_phases,
 # Process one CASA bandpass table
 # ============================================================
 
-def process_table(input_path, output_path, window, make_plots=True):
+def process_table(input_path, output_path, window, make_plots=True,
+                  clip_sigma=None, flag_grow=0):
     """
-    Copy one CASA bandpass table and smooth every row/polarization.
+    Copy one CASA bandpass table, optionally flag errant channels,
+    and smooth every row/polarization.
+
+    Returns (n_grown, n_clipped, n_solutions): totals over all rows
+    and polarizations.
     """
     from casacore.tables import table
 
@@ -256,18 +310,34 @@ def process_table(input_path, output_path, window, make_plots=True):
     output_amplitudes = []
     output_phases = []
     plot_flags = []
+    plot_new_flags = []
+
+    total_grown = 0
+    total_clipped = 0
+    n_solutions = 0
 
     try:
         for row in range(tb.nrows()):
             cparam = np.asarray(tb.getcell("CPARAM", row))
             flags = np.asarray(tb.getcell("FLAG", row))
 
+            flags_changed = False
+
             for pol, input_spectrum, input_flag in iter_pol_spectra(cparam, flags):
-                output_spectrum = smooth_complex_bandpass(
-                    input_spectrum, input_flag, window
+                output_spectrum, output_flag, n_grown, n_clipped = clean_and_smooth_bandpass(
+                    input_spectrum, input_flag, window,
+                    clip_sigma=clip_sigma, flag_grow=flag_grow,
                 )
 
                 set_pol_spectrum(cparam, pol, output_spectrum)
+
+                if n_grown or n_clipped:
+                    set_pol_spectrum(flags, pol, output_flag)
+                    flags_changed = True
+
+                total_grown += n_grown
+                total_clipped += n_clipped
+                n_solutions += 1
 
                 if make_plots:
                     input_amplitudes.append(np.abs(input_spectrum))
@@ -275,12 +345,23 @@ def process_table(input_path, output_path, window, make_plots=True):
                     output_amplitudes.append(np.abs(output_spectrum))
                     output_phases.append(np.degrees(np.angle(output_spectrum)))
                     plot_flags.append(input_flag)
+                    plot_new_flags.append(output_flag & ~input_flag)
 
             tb.putcell("CPARAM", row, cparam)
-            # FLAG is deliberately left unchanged.
+
+            if flags_changed:
+                tb.putcell("FLAG", row, flags)
     finally:
         tb.flush()
         tb.close()
+
+    if flag_grow or clip_sigma:
+        print(
+            "Flagged by this step: {} channels by flag growth, {} by clipping "
+            "(over {} antenna/polarization solutions)".format(
+                total_grown, total_clipped, n_solutions
+            )
+        )
 
     if make_plots:
         plot_table(
@@ -291,21 +372,32 @@ def process_table(input_path, output_path, window, make_plots=True):
             output_amplitudes=np.array(output_amplitudes),
             output_phases=np.array(output_phases),
             flags=np.array(plot_flags),
+            new_flags=np.array(plot_new_flags),
         )
+
+    return total_grown, total_clipped, n_solutions
 
 
 # ============================================================
 # Orchestration (called by the CLI)
 # ============================================================
 
-def smooth_tables(input_pattern, output_tag="_smooth", window=95, make_plots=True):
+def smooth_tables(input_pattern, output_tag="_smooth", window=95, make_plots=True,
+                  clip_sigma=None, flag_grow=0):
     """
     Smooth every bandpass table matching `input_pattern`, writing a
     new table alongside each input with `output_tag` inserted before
     the `.B0` suffix.
+
+    `clip_sigma` (default None: off) and `flag_grow` (default 0: off)
+    enable the optional cleaning steps described in
+    `clean_and_smooth_bandpass`.
     """
     if window < 1 or window % 2 == 0:
         raise ValueError("window must be a positive odd number")
+
+    if flag_grow < 0:
+        raise ValueError("flag_grow must be zero or positive")
 
     input_tables = find_input_tables(input_pattern, output_tag)
 
@@ -318,7 +410,10 @@ def smooth_tables(input_pattern, output_tag="_smooth", window=95, make_plots=Tru
     for input_path in input_tables:
         output_path = make_output_path(input_path, output_tag)
 
-        process_table(input_path, output_path, window, make_plots=make_plots)
+        process_table(
+            input_path, output_path, window, make_plots=make_plots,
+            clip_sigma=clip_sigma, flag_grow=flag_grow,
+        )
 
         output_paths.append(output_path)
 
